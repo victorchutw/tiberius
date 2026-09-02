@@ -28,11 +28,12 @@ impl Numeric {
     /// Creates a new Numeric value.
     ///
     /// # Panic
-    /// It will panic if the scale exceed 37.
+    /// It will panic if the scale exceeds 38.
     pub fn new_with_scale(value: i128, scale: u8) -> Self {
-        // scale cannot exceed 37 since a
-        // max precision of 38 is possible here.
-        assert!(scale < 38);
+        // SQL Server caps both precision and scale at 38 and lets the scale
+        // equal the precision, so `decimal(38, 38)` is a valid column type
+        // and scale 38 must be accepted; 10^38 still fits in an i128.
+        assert!(scale <= 38);
 
         Numeric { value, scale }
     }
@@ -76,7 +77,12 @@ impl Numeric {
         }
 
         if result == 0 {
-            1 + self.scale()
+            // Without integral digits the value is fully described by its
+            // fractional digits, so the precision is the scale itself; a
+            // zero at scale 0 still needs one digit. Counting the integral
+            // zero as a digit would describe a scale-38 fraction as the
+            // invalid `numeric(39, 38)`.
+            std::cmp::max(self.scale(), 1)
         } else {
             result + self.scale()
         }
@@ -372,6 +378,122 @@ mod tests {
     fn calculates_precision_correctly() {
         let n = Numeric::new_with_scale(57705, 2);
         assert_eq!(5, n.precision());
+    }
+
+    #[test]
+    fn new_with_scale_accepts_scale_38() {
+        let max_magnitude = 10i128.pow(38) - 1;
+
+        for value in [-1, 0, 1, max_magnitude, -max_magnitude] {
+            let n = Numeric::new_with_scale(value, 38);
+            assert_eq!(n.value(), value);
+            assert_eq!(n.scale(), 38);
+            assert_eq!(n.int_part(), 0);
+            assert_eq!(n.dec_part(), value);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn new_with_scale_rejects_scale_39() {
+        Numeric::new_with_scale(1, 39);
+    }
+
+    #[test]
+    fn precision_counts_integral_digits_plus_scale() {
+        assert_eq!(Numeric::new_with_scale(57705, 2).precision(), 5);
+        assert_eq!(Numeric::new_with_scale(-57705, 2).precision(), 5);
+        assert_eq!(Numeric::new_with_scale(1, 0).precision(), 1);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(37), 1).precision(), 38);
+    }
+
+    #[test]
+    fn precision_without_integral_digits_is_the_scale() {
+        // 0.05 is numeric(2,2), not numeric(3,2).
+        assert_eq!(Numeric::new_with_scale(5, 2).precision(), 2);
+        assert_eq!(Numeric::new_with_scale(-5, 2).precision(), 2);
+
+        // A scale-38 fraction is numeric(38,38); 39 is not a valid precision.
+        let max_magnitude = 10i128.pow(38) - 1;
+        for value in [-1, 0, 1, max_magnitude, -max_magnitude] {
+            assert_eq!(
+                Numeric::new_with_scale(value, 38).precision(),
+                38,
+                "precision of {value} at scale 38"
+            );
+        }
+
+        // Zero at scale 0 still needs one digit.
+        assert_eq!(Numeric::new_with_scale(0, 0).precision(), 1);
+        assert_eq!(Numeric::new_with_scale(0, 5).precision(), 5);
+    }
+
+    #[test]
+    fn len_follows_the_precision_buckets_for_fractions() {
+        // A fraction-only value sits exactly on the precision bucket edge
+        // its scale names: nine fractional digits fit the 4-byte form.
+        assert_eq!(Numeric::new_with_scale(10i128.pow(9) - 1, 9).len(), 5);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(10) - 1, 10).len(), 9);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(19) - 1, 19).len(), 9);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(20) - 1, 20).len(), 13);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(28) - 1, 28).len(), 13);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(29) - 1, 29).len(), 17);
+        assert_eq!(Numeric::new_with_scale(10i128.pow(38) - 1, 38).len(), 17);
+        assert_eq!(Numeric::new_with_scale(-1, 38).len(), 17);
+    }
+
+    #[test]
+    fn encode_writes_sign_and_little_endian_magnitude_at_scale_38() {
+        let mut buf = BytesMut::new();
+        Numeric::new_with_scale(-1, 38)
+            .encode(&mut buf)
+            .expect("encode must succeed");
+
+        // length, sign (0 = negative), then the 16-byte magnitude.
+        let mut expected = vec![17u8, 0];
+        expected.extend_from_slice(&1u128.to_le_bytes());
+        assert_eq!(&buf[..], &expected[..]);
+    }
+
+    async fn assert_round_trip(value: i128, scale: u8) {
+        use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+        let n = Numeric::new_with_scale(value, scale);
+        let mut buf = BytesMut::new();
+        n.encode(&mut buf).expect("encode must succeed");
+        assert_eq!(buf[0], n.len(), "length byte of {value} at scale {scale}");
+        assert_eq!(
+            buf.len(),
+            n.len() as usize + 1,
+            "byte count of {value} at scale {scale}"
+        );
+
+        let decoded = Numeric::decode(&mut buf.into_sql_read_bytes(), scale)
+            .await
+            .expect("decode must succeed")
+            .expect("value must be present");
+
+        assert_eq!(decoded.value(), value);
+        assert_eq!(decoded.scale(), scale);
+    }
+
+    #[tokio::test]
+    async fn encode_decode_round_trips_scale_38_boundaries() {
+        let max_magnitude = 10i128.pow(38) - 1;
+
+        for value in [-1, 0, 1, max_magnitude, -max_magnitude] {
+            assert_round_trip(value, 38).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn encode_decode_round_trips_fraction_only_bucket_edges() {
+        for scale in [9u8, 10, 19, 20, 28, 29] {
+            let max_fraction = 10i128.pow(scale as u32) - 1;
+            assert_round_trip(max_fraction, scale).await;
+            assert_round_trip(-max_fraction, scale).await;
+            assert_round_trip(1, scale).await;
+        }
     }
 
     #[test]

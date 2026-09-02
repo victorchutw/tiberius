@@ -1801,6 +1801,72 @@ where
     Ok(())
 }
 
+#[test_on_runtimes]
+async fn numeric_type_scale_38_presentation<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // decimal(38,38): every digit is fractional, so the parameter metadata
+    // must declare numeric(38,38); the server rejects a precision of 39.
+    let max_magnitude = 10i128.pow(38) - 1;
+
+    for (value, text) in [
+        (-1, "-0.00000000000000000000000000000000000001"),
+        (0, "0.00000000000000000000000000000000000000"),
+        (1, "0.00000000000000000000000000000000000001"),
+        (max_magnitude, "0.99999999999999999999999999999999999999"),
+        (-max_magnitude, "-0.99999999999999999999999999999999999999"),
+    ] {
+        let num = Numeric::new_with_scale(value, 38);
+
+        let row = conn
+            .query("SELECT @P1, CONVERT(VARCHAR(60), @P1)", &[&num])
+            .await?
+            .into_row()
+            .await?
+            .unwrap();
+
+        let round_tripped: Numeric = row.get(0).unwrap();
+        assert_eq!(round_tripped.value(), value);
+        assert_eq!(round_tripped.scale(), 38);
+        assert_eq!(row.get::<&str, _>(1), Some(text));
+    }
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn numeric_type_fraction_only_length_buckets_presentation<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // A fraction-only value whose scale sits on a wire-length bucket edge
+    // (9, 19, or 28 digits) is declared at that precision and travels in
+    // the shorter length form.
+    for scale in [9u8, 19, 28] {
+        let max_fraction = 10i128.pow(scale as u32) - 1;
+
+        for value in [max_fraction, -max_fraction, 1] {
+            let num = Numeric::new_with_scale(value, scale);
+
+            let row = conn
+                .query("SELECT @P1", &[&num])
+                .await?
+                .into_row()
+                .await?
+                .unwrap();
+
+            let round_tripped: Numeric = row.get(0).unwrap();
+            assert_eq!(round_tripped.value(), value);
+            assert_eq!(round_tripped.scale(), scale);
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(feature = "rust_decimal")]
 #[cfg(test)]
 mod rust_decimal {

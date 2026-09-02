@@ -952,6 +952,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn numeric_scale_38_with_varlen_sized_precision() {
+        test_round_trip(
+            TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Numericn,
+                size: 17,
+                precision: 38,
+                scale: 38,
+            },
+            ColumnData::Numeric(Some(Numeric::new_with_scale(-1, 38))),
+        )
+        .await;
+    }
+
+    #[test]
+    fn numeric_scale_38_without_type_info_declares_precision_38() {
+        let mut buf = BytesMut::new();
+        let mut dst = BytesMutWithTypeInfo::new(&mut buf);
+
+        ColumnData::Numeric(Some(Numeric::new_with_scale(-1, 38)))
+            .encode(&mut dst)
+            .expect("encode must succeed");
+
+        // TYPE_INFO: NUMERICNTYPE, max length, precision, scale.
+        assert_eq!(&buf[..4], &[VarLenType::Numericn as u8, 17, 38, 38]);
+        // Value: length, sign (0 = negative), then the magnitude.
+        assert_eq!(&buf[4..6], &[17, 0]);
+        assert_eq!(&buf[6..], &1u128.to_le_bytes());
+    }
+
+    #[test]
+    fn numeric_type_name_uses_the_corrected_precision() {
+        let scale_38 = ColumnData::Numeric(Some(Numeric::new_with_scale(-1, 38)));
+        assert_eq!(scale_38.type_name(), "numeric(38,38)");
+
+        let fraction = ColumnData::Numeric(Some(Numeric::new_with_scale(5, 2)));
+        assert_eq!(fraction.type_name(), "numeric(2,2)");
+
+        let mixed = ColumnData::Numeric(Some(Numeric::new_with_scale(57705, 2)));
+        assert_eq!(mixed.type_name(), "numeric(5,2)");
+    }
+
+    #[tokio::test]
     async fn none_numeric_with_varlen_sized_precision() {
         test_round_trip(
             TypeInfo::VarLenSizedPrecision {

@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::env;
 use std::sync::Once;
-use tiberius::{IntoSql, Result, TokenRow};
+use tiberius::{numeric::Numeric, ColumnData, IntoSql, Result, TokenRow};
 
 #[cfg(all(feature = "tds73", feature = "chrono"))]
 use chrono::DateTime;
@@ -218,3 +218,144 @@ test_bulk_type!(datetime2_7(
     100,
     vec![DateTime::from_timestamp(1658524194, 123456789); 100].into_iter()
 ));
+
+#[test_on_runtimes]
+async fn bulk_load_decimal_38_38_round_trips_values<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, content DECIMAL(38,38) NULL)",
+            table,
+        ),
+        &[],
+    )
+    .await?;
+
+    let max_magnitude = 10i128.pow(38) - 1;
+    let values = [
+        Some(-1),
+        Some(0),
+        Some(1),
+        Some(max_magnitude),
+        Some(-max_magnitude),
+        None,
+    ];
+    let expected_text = [
+        Some("-0.00000000000000000000000000000000000001"),
+        Some("0.00000000000000000000000000000000000000"),
+        Some("0.00000000000000000000000000000000000001"),
+        Some("0.99999999999999999999999999999999999999"),
+        Some("-0.99999999999999999999999999999999999999"),
+        None,
+    ];
+
+    let mut req = conn.bulk_insert(&table).await?;
+
+    for value in values {
+        let mut row = TokenRow::new();
+        row.push(match value {
+            Some(value) => Numeric::new_with_scale(value, 38).into_sql(),
+            None => ColumnData::Numeric(None),
+        });
+        req.send(row).await?;
+    }
+
+    let res = req.finalize().await?;
+    assert_eq!(values.len() as u64, res.total());
+
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT content, CONVERT(VARCHAR(60), content) FROM {} ORDER BY id",
+                table
+            ),
+            &[],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(rows.len(), values.len());
+
+    for ((row, value), text) in rows.iter().zip(values).zip(expected_text) {
+        let stored: Option<Numeric> = row.get(0);
+        assert_eq!(stored.map(|n| n.value()), value);
+        assert_eq!(stored.map(|n| n.scale()), value.map(|_| 38));
+        assert_eq!(row.get::<&str, _>(1), text);
+    }
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_load_decimal_fraction_only_length_buckets<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // Fraction-only values on the wire-length bucket edges (9, 19, and 28
+    // fractional digits) reach the server in the shorter length form the
+    // corrected precision selects, and read back unchanged.
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY PRIMARY KEY, \
+             s9 DECIMAL(38,9) NOT NULL, s19 DECIMAL(38,19) NOT NULL, s28 DECIMAL(38,28) NOT NULL)",
+            table,
+        ),
+        &[],
+    )
+    .await?;
+
+    let scales = [9u8, 19, 28];
+    let rows_to_send: Vec<[i128; 3]> = vec![
+        [10i128.pow(9) - 1, 10i128.pow(19) - 1, 10i128.pow(28) - 1],
+        [
+            -(10i128.pow(9) - 1),
+            -(10i128.pow(19) - 1),
+            -(10i128.pow(28) - 1),
+        ],
+        [1, 1, 1],
+        [0, 0, 0],
+    ];
+
+    let mut req = conn.bulk_insert(&table).await?;
+
+    for values in &rows_to_send {
+        let mut row = TokenRow::new();
+        for (value, scale) in values.iter().zip(scales) {
+            row.push(Numeric::new_with_scale(*value, scale).into_sql());
+        }
+        req.send(row).await?;
+    }
+
+    let res = req.finalize().await?;
+    assert_eq!(rows_to_send.len() as u64, res.total());
+
+    let rows = conn
+        .query(
+            &format!("SELECT s9, s19, s28 FROM {} ORDER BY id", table),
+            &[],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(rows.len(), rows_to_send.len());
+
+    for (row, values) in rows.iter().zip(&rows_to_send) {
+        for (index, (value, scale)) in values.iter().zip(scales).enumerate() {
+            let stored: Numeric = row.get(index).unwrap();
+            assert_eq!(stored.value(), *value, "column {index}");
+            assert_eq!(stored.scale(), scale, "column {index}");
+        }
+    }
+
+    Ok(())
+}
