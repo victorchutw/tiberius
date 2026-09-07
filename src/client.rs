@@ -300,11 +300,57 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         &'a mut self,
         table: &'a str,
     ) -> crate::Result<BulkLoadRequest<'a, S>> {
+        self.bulk_insert_inner(table, None).await
+    }
+
+    /// Start a bulk insert containing only the named columns, in the supplied
+    /// order. Each row must contain exactly these columns in this order.
+    /// Names must match the server metadata exactly (including case); they are
+    /// identifiers, not SQL expressions. Empty, duplicate, unknown, and
+    /// non-updateable (including IDENTITY) columns return an error before the
+    /// bulk request starts. As with [`Client::bulk_insert`], `table` is a SQL
+    /// identifier supplied by the caller and must be quoted when necessary.
+    ///
+    /// Omitted columns are supplied by SQL Server (DEFAULT, NULL, or IDENTITY).
+    /// This does not enable KEEPNULLS or KEEPIDENTITY: a NULL sent for a selected
+    /// column with a default still uses that default. Existing transaction
+    /// semantics are preserved; finalize the request before committing or
+    /// rolling back the transaction.
+    pub async fn bulk_insert_with_columns<'a>(
+        &'a mut self,
+        table: &'a str,
+        columns: &[&str],
+    ) -> crate::Result<BulkLoadRequest<'a, S>> {
+        if columns.is_empty()
+            || columns
+                .iter()
+                .enumerate()
+                .any(|(i, c)| columns[..i].contains(c))
+        {
+            return Err(crate::Error::BulkInput(
+                "bulk columns must be non-empty and unique".into(),
+            ));
+        }
+        self.bulk_insert_inner(table, Some(columns)).await
+    }
+
+    async fn bulk_insert_inner<'a>(
+        &'a mut self,
+        table: &'a str,
+        selected: Option<&[&str]>,
+    ) -> crate::Result<BulkLoadRequest<'a, S>> {
         // Start the bulk request
         self.connection.flush_stream().await?;
 
         // retrieve column metadata from server
-        let query = format!("SELECT TOP 0 * FROM {}", table);
+        let projection = match selected {
+            Some(names) => names
+                .iter()
+                .map(|name| format!("[{}]", name.replace(']', "]]")))
+                .join(", "),
+            None => "*".to_owned(),
+        };
+        let query = format!("SELECT TOP 0 {} FROM {}", projection, table);
 
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
 
@@ -323,14 +369,30 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             })
             .await?;
 
-        // now start bulk upload
-        let columns: Vec<_> = columns
-            .ok_or_else(|| {
-                crate::Error::Protocol("expecting column metadata from query but not found".into())
-            })?
-            .into_iter()
-            .filter(|column| column.base.flags.contains(ColumnFlag::Updateable))
-            .collect();
+        let columns = columns.ok_or_else(|| {
+            crate::Error::Protocol("expecting column metadata from query but not found".into())
+        })?;
+        let columns = match selected {
+            Some(names) => names
+                .iter()
+                .map(|name| {
+                    columns
+                        .iter()
+                        .find(|column| column.col_name == *name)
+                        .filter(|column| column.base.flags.contains(ColumnFlag::Updateable))
+                        .cloned()
+                        .ok_or_else(|| {
+                            crate::Error::BulkInput(
+                                format!("unknown or non-updateable bulk column: {name}").into(),
+                            )
+                        })
+                })
+                .collect::<crate::Result<Vec<_>>>()?,
+            None => columns
+                .into_iter()
+                .filter(|column| column.base.flags.contains(ColumnFlag::Updateable))
+                .collect(),
+        };
 
         self.connection.flush_stream().await?;
         let col_data = columns.iter().map(|c| format!("{}", c)).join(", ");

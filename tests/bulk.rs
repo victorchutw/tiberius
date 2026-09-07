@@ -359,3 +359,107 @@ where
 
     Ok(())
 }
+
+#[test_on_runtimes]
+async fn bulk_selected_columns_defaults_nulls_identity_order_and_rollback<S>(
+    mut conn: tiberius::Client<S>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+    conn.execute(
+        &format!(
+            "CREATE TABLE {table} (id INT IDENTITY PRIMARY KEY, [left] INT NULL, \
+         omitted INT NOT NULL DEFAULT 42, money_value MONEY NULL, \
+         small_money SMALLMONEY NULL, variant SQL_VARIANT NULL, \
+         [right]] value] INT NULL, explicit_null INT NULL, \
+         selected_default INT NULL DEFAULT 99, calculated AS ([left] + 1))"
+        ),
+        &[],
+    )
+    .await?;
+
+    // Reject the entire selection instead of silently dropping a column, and
+    // leave the connection usable after every validation error.
+    for columns in [
+        &[][..],
+        &["left", "left"],
+        &["missing"],
+        &["id"],
+        &["calculated"],
+    ] {
+        assert!(conn
+            .bulk_insert_with_columns(&table, columns)
+            .await
+            .is_err());
+        let row = conn
+            .query("SELECT 1", &[])
+            .await?
+            .into_row()
+            .await?
+            .unwrap();
+        assert_eq!(row.get::<i32, _>(0), Some(1));
+    }
+
+    for rollback in [true, false] {
+        conn.simple_query("BEGIN TRAN")
+            .await?
+            .into_results()
+            .await?;
+        let mut req = conn
+            .bulk_insert_with_columns(
+                &table,
+                &["right] value", "left", "explicit_null", "selected_default"],
+            )
+            .await?;
+        let mut row = TokenRow::new();
+        row.push(22i32.into_sql());
+        row.push(11i32.into_sql());
+        row.push(ColumnData::I32(None));
+        row.push(ColumnData::I32(None));
+        req.send(row).await?;
+        assert_eq!(req.finalize().await?.total(), 1);
+        let row = conn
+            .query(
+                &format!(
+                    "SELECT id, [left], [right]] value], omitted, money_value, \
+             small_money, explicit_null, selected_default FROM {table}"
+                ),
+                &[],
+            )
+            .await?
+            .into_row()
+            .await?
+            .unwrap();
+        assert!(row.get::<i32, _>(0).unwrap() > 0);
+        assert_eq!(row.get::<i32, _>(1), Some(11));
+        assert_eq!(row.get::<i32, _>(2), Some(22));
+        assert_eq!(row.get::<i32, _>(3), Some(42));
+        assert_eq!(row.get::<f64, _>(4), None);
+        assert_eq!(row.get::<f64, _>(5), None);
+        // SQL_VARIANT is unsupported by the decoder for non-null values;
+        // prove its omitted NULL using server-side predicates below.
+        assert_eq!(row.get::<i32, _>(6), None);
+        assert_eq!(row.get::<i32, _>(7), Some(99));
+        conn.simple_query(if rollback {
+            "ROLLBACK TRAN"
+        } else {
+            "COMMIT TRAN"
+        })
+        .await?
+        .into_results()
+        .await?;
+        let row = conn
+            .query(
+                &format!("SELECT COUNT(*) FROM {table} WHERE variant IS NULL"),
+                &[],
+            )
+            .await?
+            .into_row()
+            .await?
+            .unwrap();
+        assert_eq!(row.get::<i32, _>(0), Some(if rollback { 0 } else { 1 }));
+    }
+    Ok(())
+}
