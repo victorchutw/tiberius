@@ -25,7 +25,7 @@ pub struct MetaDataColumn<'a> {
 
 impl<'a> Display for MetaDataColumn<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} ", self.col_name)?;
+        write!(f, "[{}] ", self.col_name.replace(']', "]]"))?;
 
         match &self.base.ty {
             TypeInfo::FixedLen(fixed) => match fixed {
@@ -345,5 +345,29 @@ impl BaseMetaDataColumn {
         };
 
         Ok(BaseMetaDataColumn { flags, ty })
+    }
+}
+
+#[cfg(test)]
+mod bulk_identifier_tests {
+    use super::*;
+
+    #[test]
+    fn column_declaration_quotes_names_as_single_identifiers() {
+        for (name, expected) in [
+            ("ordinary", "[ordinary] int"),
+            ("select", "[select] int"),
+            ("right] value", "[right]] value] int"),
+            ("a.b", "[a.b] int"),
+        ] {
+            let column = MetaDataColumn {
+                col_name: name.into(),
+                base: BaseMetaDataColumn {
+                    flags: BitFlags::empty(),
+                    ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                },
+            };
+            assert_eq!(column.to_string(), expected);
+        }
     }
 }
